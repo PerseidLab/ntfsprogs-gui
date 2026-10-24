@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  prepare-appdir:
     runs-on: ubuntu-22.04
     container: archlinux:latest
-    permissions:
-      contents: write
+    outputs:
+      run_number: ${{ github.run_number }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -437,18 +437,53 @@ jobs:
           EOF
           ln -s usr/share/icons/hicolor/scalable/apps/ntfsprogs.svg .
 
-      - name: Download appimagetool and generate AppImage
+      - name: Upload AppDir Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-appdir
+          path: AppDir
+
+  build-appimage:
+    needs: prepare-appdir
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download AppDir Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: compiled-appdir
+          path: AppDir
+
+      - name: Restore permissions and generate AppImage on Host
         run: |
-          wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+          sudo apt-get update && sudo apt-get install -y wget libfuse2 jq
+          
+          # Fix permissions stripped away by artifact upload/download actions
+          chmod +x AppDir/AppRun
+          chmod -R +x AppDir/usr/bin/
+          
+          TOOL_URL=$(wget -qO- https://api.github.com/repos/probonopd/go-appimage/releases/tags/continuous | jq -r '.assets[] | select(.name | test("appimagetool-.*-x86_64\\.AppImage$")) | .browser_download_url' | head -n 1)
+          
+          if [ -z "$TOOL_URL" ]; then
+            echo "Error: Could not find appimagetool URL automatically."
+            exit 1
+          fi
+          
+          echo "Downloading appimagetool from: $TOOL_URL"
+          wget "$TOOL_URL" -O appimagetool
           chmod +x appimagetool
           
           export ARCH=x86_64
-          ./appimagetool AppDir ntfsprogs-gui-x86_64.AppImage --appimage-extract-and-run
+          export VERSION=1.0.${{ needs.prepare-appdir.outputs.run_number }}
+          ./appimagetool AppDir
+          
+          mv *.AppImage ntfsprogs-gui-x86_64.AppImage
 
       - name: Create GitHub Release and Upload AppImage
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: "ntfsprogs GUI v1.0.${{ github.run_number }}"
+          tag_name: v1.0.${{ needs.prepare-appdir.outputs.run_number }}
+          name: "ntfsprogs GUI v1.0.${{ needs.prepare-appdir.outputs.run_number }}"
           body: ""
           files: ntfsprogs-gui-x86_64.AppImage
