@@ -1,0 +1,454 @@
+name: Build ntfsprogs GUI AppImage
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    container: archlinux:latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize pacman and install ntfsprogs, ntfs-3g, and python
+        run: |
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Syu --noconfirm base-devel ntfsprogs ntfs-3g python tk wget util-linux
+
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/lib
+          mkdir -p AppDir/usr/share/ntfsprogs
+
+          for tool in mkntfs mkfs.ntfs ntfsfix ntfsresize ntfsclone ntfs-3g umount lsblk; do
+              if [ -f "/usr/bin/$tool" ]; then
+                  cp -u "/usr/bin/$tool" AppDir/usr/bin/
+              elif [ -f "/bin/$tool" ]; then
+                  cp -u "/bin/$tool" AppDir/usr/bin/
+              fi
+          done
+
+          for bin in AppDir/usr/bin/*; do
+              if [ -f "$bin" ] && [ -x "$bin" ]; then
+                  echo "Analyzing dependencies for: $bin"
+                  for lib in $(ldd "$bin" 2>/dev/null | grep -oP '/usr/lib/[^\s]+|/lib/[^\s]+'); do
+                      if [ -f "$lib" ]; then
+                          if [[ "$lib" == *"libc.so"* ]] || [[ "$lib" == *"ld-linux"* ]] || [[ "$lib" == *"libm.so"* ]] || [[ "$lib" == *"libpthread"* ]] || [[ "$lib" == *"libdl"* ]] || [[ "$lib" == *"libgcc_s"* ]]; then
+                              continue
+                          fi
+                          cp -u "$lib" AppDir/usr/lib/
+                      fi
+                  done
+              fi
+          done
+
+      - name: Create Python GUI Script & AppRun Wrapper
+        run: |
+          cd AppDir
+          
+          cat << 'EOF' > usr/share/ntfsprogs/gui.py
+          import sys
+          import tkinter as tk
+          from tkinter import ttk, messagebox, scrolledtext
+          import subprocess
+          import threading
+          import os
+          import shutil
+          import shlex
+
+          class NtfsToolsApp:
+              def __init__(self, root):
+                  self.root = root
+                  self.root.title("NTFS Utilities GUI (ntfsprogs & ntfs-3g)")
+                  self.root.geometry("780x620")
+                  self.root.minsize(720, 560)
+
+                  self.tools_dir = "/tmp/ntfsprogs_runtime_bin"
+                  os.makedirs(self.tools_dir, exist_ok=True)
+                  self.setup_runtime_files()
+
+                  style = ttk.Style()
+                  style.theme_use('clam')
+
+                  self.notebook = ttk.Notebook(root)
+                  self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
+
+                  self.create_mkntfs_tab()
+                  self.create_ntfsfix_tab()
+                  self.create_ntfsresize_tab()
+                  self.create_ntfsclone_tab()
+                  self.create_ntfs3g_tab()
+
+                  console_frame = ttk.LabelFrame(root, text="Execution Output / Logs")
+                  console_frame.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+
+                  self.console = scrolledtext.ScrolledText(console_frame, wrap=tk.WORD, height=10, bg="#1e1e1e", fg="#00ff00", insertbackground="white")
+                  self.console.pack(fill='both', expand=True, padx=5, pady=5)
+
+                  btn_clear = ttk.Button(console_frame, text="Clear Console", command=self.clear_console)
+                  btn_clear.pack(anchor='e', padx=5, pady=(0, 5))
+
+              def setup_runtime_files(self):
+                  appdir = os.environ.get("APPDIR")
+                  if appdir:
+                      src_bin_dir = os.path.join(appdir, "usr", "bin")
+                      if os.path.exists(src_bin_dir):
+                          for f in os.listdir(src_bin_dir):
+                              src_file = os.path.join(src_bin_dir, f)
+                              dst_file = os.path.join(self.tools_dir, f)
+                              if os.path.isfile(src_file):
+                                  shutil.copy2(src_file, dst_file)
+                                  os.chmod(dst_file, 0o755)
+
+                      src_lib_dir = os.path.join(appdir, "usr", "lib")
+                      if os.path.exists(src_lib_dir):
+                          for f in os.listdir(src_lib_dir):
+                              src_file = os.path.join(src_lib_dir, f)
+                              dst_file = os.path.join(self.tools_dir, f)
+                              if os.path.islink(src_file):
+                                  target = os.readlink(src_file)
+                                  if os.path.lexists(dst_file):
+                                      os.remove(dst_file)
+                                  try:
+                                      os.symlink(target, dst_file)
+                                  except Exception:
+                                      pass
+                              elif os.path.isfile(src_file):
+                                  shutil.copy2(src_file, dst_file)
+
+              def get_ntfs_partitions(self):
+                  partitions = []
+                  lsblk_path = os.path.join(self.tools_dir, "lsblk")
+                  if not os.path.exists(lsblk_path):
+                      lsblk_path = "lsblk"
+                  try:
+                      res = subprocess.run([lsblk_path, "-r", "-o", "NAME,FSTYPE,LABEL"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                      for line in res.stdout.splitlines():
+                          parts = line.split(maxsplit=2)
+                          if len(parts) >= 2 and parts[1].lower() == 'ntfs':
+                              dev_name = parts[0].strip()
+                              label = parts[2].strip() if len(parts) > 2 else ""
+                              dev_path = f"/dev/{dev_name}"
+                              if os.path.exists(dev_path):
+                                  display_str = f"{dev_path} ({label})" if label else dev_path
+                                  partitions.append((dev_path, display_str))
+                  except Exception:
+                      pass
+                  return partitions
+
+              def log(self, message):
+                  self.console.insert(tk.END, message + "\n")
+                  self.console.see(tk.END)
+
+              def clear_console(self):
+                  self.console.delete('1.0', tk.END)
+
+              def run_command(self, cmd_list):
+                  def target():
+                      binary_name = cmd_list[0]
+                      binary_path = os.path.join(self.tools_dir, binary_name)
+                      if not os.path.exists(binary_path):
+                          binary_path = shutil.which(binary_name) or binary_name
+                          
+                      full_cmd = [binary_path] + cmd_list[1:]
+                      args_str = " ".join([shlex.quote(arg) for arg in full_cmd])
+
+                      bash_command = f"export LD_LIBRARY_PATH={shlex.quote(self.tools_dir)}; {args_str}"
+
+                      if os.geteuid() != 0:
+                          if os.path.exists("/usr/bin/pkexec"):
+                              elevated_cmd = ["pkexec", "bash", "-c", bash_command]
+                          elif os.path.exists("/usr/bin/sudo"):
+                              elevated_cmd = ["sudo", "bash", "-c", bash_command]
+                          else:
+                              elevated_cmd = ["bash", "-c", bash_command]
+                      else:
+                          elevated_cmd = ["bash", "-c", bash_command]
+
+                      self.log(f"$ {' '.join(cmd_list)}")
+                      try:
+                          process = subprocess.Popen(elevated_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                          for line in process.stdout:
+                              self.log(line.strip())
+                          process.wait()
+                          if process.returncode == 0:
+                              self.log("[INFO] Command executed successfully.\n")
+                          else:
+                              self.log(f"[ERROR] Command exited with code {process.returncode}.\n")
+                      except Exception as e:
+                          self.log(f"[EXCEPTION] {str(e)}\n")
+                  threading.Thread(target=target, daemon=True).start()
+
+              def extract_dev_path(self, val):
+                  val = val.strip()
+                  if " " in val:
+                      return val.split()[0]
+                  return val
+
+              def create_mkntfs_tab(self):
+                  frame = ttk.Frame(self.notebook)
+                  self.notebook.add(frame, text="mkntfs (Format)")
+
+                  ttk.Label(frame, text="Create/Format an NTFS filesystem on a partition.", font=('Arial', 10, 'bold')).grid(row=0, column=0, columnspan=3, sticky='w', padx=10, pady=10)
+
+                  ttk.Label(frame, text="Device Partition:").grid(row=1, column=0, sticky='w', padx=10, pady=5)
+                  self.mk_dev = ttk.Combobox(frame, width=32, state="normal")
+                  self.mk_dev.grid(row=1, column=1, sticky='w', padx=10, pady=5)
+                  
+                  btn_refresh = ttk.Button(frame, text="Refresh", command=lambda: self.populate_combobox(self.mk_dev))
+                  btn_refresh.grid(row=1, column=2, sticky='w', padx=5, pady=5)
+
+                  ttk.Label(frame, text="Volume Label:").grid(row=2, column=0, sticky='w', padx=10, pady=5)
+                  self.mk_label = ttk.Entry(frame, width=34)
+                  self.mk_label.grid(row=2, column=1, columnspan=2, sticky='w', padx=10, pady=5)
+
+                  self.mk_quick = tk.BooleanVar(value=True)
+                  ttk.Checkbutton(frame, text="Quick format (-Q)", variable=self.mk_quick).grid(row=3, column=1, sticky='w', padx=10, pady=5)
+
+                  btn = ttk.Button(frame, text="Run mkntfs", command=self.execute_mkntfs)
+                  btn.grid(row=4, column=1, sticky='w', padx=10, pady=15)
+                  
+                  self.populate_combobox(self.mk_dev)
+
+              def execute_mkntfs(self):
+                  dev = self.extract_dev_path(self.mk_dev.get())
+                  if not dev:
+                      messagebox.showerror("Error", "Please specify a device partition.")
+                      return
+                  cmd = ["mkntfs"]
+                  if self.mk_quick.get():
+                      cmd.append("-Q")
+                  label = self.mk_label.get().strip()
+                  if label:
+                      cmd.extend(["-L", label])
+                  cmd.append(dev)
+                  self.run_command(cmd)
+
+              def create_ntfsfix_tab(self):
+                  frame = ttk.Frame(self.notebook)
+                  self.notebook.add(frame, text="ntfsfix (Repair)")
+
+                  ttk.Label(frame, text="Fix common NTFS errors and clear the log file.", font=('Arial', 10, 'bold')).grid(row=0, column=0, columnspan=3, sticky='w', padx=10, pady=10)
+
+                  ttk.Label(frame, text="Device Partition:").grid(row=1, column=0, sticky='w', padx=10, pady=5)
+                  self.fix_dev = ttk.Combobox(frame, width=32, state="normal")
+                  self.fix_dev.grid(row=1, column=1, sticky='w', padx=10, pady=5)
+                  
+                  btn_refresh = ttk.Button(frame, text="Refresh", command=lambda: self.populate_combobox(self.fix_dev))
+                  btn_refresh.grid(row=1, column=2, sticky='w', padx=5, pady=5)
+
+                  self.fix_dirty = tk.BooleanVar(value=True)
+                  ttk.Checkbutton(frame, text="Clear dirty bit (-d)", variable=self.fix_dirty).grid(row=2, column=1, sticky='w', padx=10, pady=5)
+
+                  btn = ttk.Button(frame, text="Run ntfsfix", command=self.execute_ntfsfix)
+                  btn.grid(row=3, column=1, sticky='w', padx=10, pady=15)
+                  
+                  self.populate_combobox(self.fix_dev)
+
+              def execute_ntfsfix(self):
+                  dev = self.extract_dev_path(self.fix_dev.get())
+                  if not dev:
+                      messagebox.showerror("Error", "Please specify a device partition.")
+                      return
+                  cmd = ["ntfsfix"]
+                  if self.fix_dirty.get():
+                      cmd.append("-d")
+                  cmd.append(dev)
+                  self.run_command(cmd)
+
+              def create_ntfsresize_tab(self):
+                  frame = ttk.Frame(self.notebook)
+                  self.notebook.add(frame, text="ntfsresize (Resize)")
+
+                  ttk.Label(frame, text="Resize an NTFS filesystem without losing data.", font=('Arial', 10, 'bold')).grid(row=0, column=0, columnspan=3, sticky='w', padx=10, pady=10)
+
+                  ttk.Label(frame, text="Device Partition:").grid(row=1, column=0, sticky='w', padx=10, pady=5)
+                  self.resize_dev = ttk.Combobox(frame, width=32, state="normal")
+                  self.resize_dev.grid(row=1, column=1, sticky='w', padx=10, pady=5)
+                  
+                  btn_refresh = ttk.Button(frame, text="Refresh", command=lambda: self.populate_combobox(self.resize_dev))
+                  btn_refresh.grid(row=1, column=2, sticky='w', padx=5, pady=5)
+
+                  ttk.Label(frame, text="New Size (e.g. 50G, 500M):").grid(row=2, column=0, sticky='w', padx=10, pady=5)
+                  self.resize_size = ttk.Entry(frame, width=34)
+                  self.resize_size.grid(row=2, column=1, columnspan=2, sticky='w', padx=10, pady=5)
+
+                  self.resize_info = tk.BooleanVar(value=False)
+                  ttk.Checkbutton(frame, text="Info only (check min/max size)", variable=self.resize_info).grid(row=3, column=1, sticky='w', padx=10, pady=5)
+
+                  btn = ttk.Button(frame, text="Run ntfsresize", command=self.execute_ntfsresize)
+                  btn.grid(row=4, column=1, sticky='w', padx=10, pady=15)
+                  
+                  self.populate_combobox(self.resize_dev)
+
+              def execute_ntfsresize(self):
+                  dev = self.extract_dev_path(self.resize_dev.get())
+                  if not dev:
+                      messagebox.showerror("Error", "Please specify a device partition.")
+                      return
+                  cmd = ["ntfsresize"]
+                  if self.resize_info.get():
+                      cmd.append("-i")
+                  else:
+                      size = self.resize_size.get().strip()
+                      if size:
+                          cmd.extend(["-s", size])
+                  cmd.append(dev)
+                  self.run_command(cmd)
+
+              def create_ntfsclone_tab(self):
+                  frame = ttk.Frame(self.notebook)
+                  self.notebook.add(frame, text="ntfsclone (Backup/Restore)")
+
+                  ttk.Label(frame, text="Efficiently backup, restore, or clone NTFS image files.", font=('Arial', 10, 'bold')).grid(row=0, column=0, columnspan=3, sticky='w', padx=10, pady=10)
+
+                  ttk.Label(frame, text="Mode:").grid(row=1, column=0, sticky='w', padx=10, pady=5)
+                  self.clone_mode = ttk.Combobox(frame, values=["Save Image (Backup)", "Restore Image"], state="readonly", width=30)
+                  self.clone_mode.grid(row=1, column=1, columnspan=2, sticky='w', padx=10, pady=5)
+                  self.clone_mode.current(0)
+
+                  ttk.Label(frame, text="Source (Partition/Image):").grid(row=2, column=0, sticky='w', padx=10, pady=5)
+                  self.clone_src = ttk.Combobox(frame, width=32, state="normal")
+                  self.clone_src.grid(row=2, column=1, sticky='w', padx=10, pady=5)
+                  
+                  btn_refresh_src = ttk.Button(frame, text="Refresh", command=lambda: self.populate_combobox(self.clone_src))
+                  btn_refresh_src.grid(row=2, column=2, sticky='w', padx=5, pady=5)
+
+                  ttk.Label(frame, text="Destination (Image/Partition):").grid(row=3, column=0, sticky='w', padx=10, pady=5)
+                  self.clone_dst = ttk.Entry(frame, width=34)
+                  self.clone_dst.grid(row=3, column=1, columnspan=2, sticky='w', padx=10, pady=5)
+
+                  btn = ttk.Button(frame, text="Run ntfsclone", command=self.execute_ntfsclone)
+                  btn.grid(row=4, column=1, sticky='w', padx=10, pady=15)
+                  
+                  self.populate_combobox(self.clone_src)
+
+              def execute_ntfsclone(self):
+                  mode = self.clone_mode.get()
+                  src = self.extract_dev_path(self.clone_src.get())
+                  dst = self.clone_dst.get().strip()
+                  if not src or not dst:
+                      messagebox.showerror("Error", "Please provide both Source and Destination.")
+                      return
+                  
+                  cmd = ["ntfsclone"]
+                  if mode == "Save Image (Backup)":
+                      cmd.extend(["--save-image", "--output", dst, src])
+                  else:
+                      cmd.extend(["--restore-image", "--output", dst, src])
+                  self.run_command(cmd)
+
+              def create_ntfs3g_tab(self):
+                  frame = ttk.Frame(self.notebook)
+                  self.notebook.add(frame, text="ntfs-3g (Mount)")
+
+                  ttk.Label(frame, text="Mount an NTFS partition to a directory folder.", font=('Arial', 10, 'bold')).grid(row=0, column=0, columnspan=3, sticky='w', padx=10, pady=10)
+
+                  ttk.Label(frame, text="Device Partition:").grid(row=1, column=0, sticky='w', padx=10, pady=5)
+                  self.mount_dev = ttk.Combobox(frame, width=32, state="normal")
+                  self.mount_dev.grid(row=1, column=1, sticky='w', padx=10, pady=5)
+                  
+                  btn_refresh = ttk.Button(frame, text="Refresh", command=lambda: self.populate_combobox(self.mount_dev))
+                  btn_refresh.grid(row=1, column=2, sticky='w', padx=5, pady=5)
+
+                  ttk.Label(frame, text="Mount Point Directory:").grid(row=2, column=0, sticky='w', padx=10, pady=5)
+                  self.mount_dir = ttk.Entry(frame, width=34)
+                  self.mount_dir.grid(row=2, column=1, columnspan=2, sticky='w', padx=10, pady=5)
+
+                  self.mount_ro = tk.BooleanVar(value=False)
+                  ttk.Checkbutton(frame, text="Mount Read-Only (-o ro)", variable=self.mount_ro).grid(row=3, column=1, sticky='w', padx=10, pady=5)
+
+                  btn_mount = ttk.Button(frame, text="Mount", command=self.execute_mount)
+                  btn_mount.grid(row=4, column=1, sticky='w', padx=10, pady=15)
+
+                  btn_unmount = ttk.Button(frame, text="Unmount (umount)", command=self.execute_unmount)
+                  btn_unmount.grid(row=4, column=1, sticky='e', padx=10, pady=15)
+                  
+                  self.populate_combobox(self.mount_dev)
+
+              def populate_combobox(self, cb):
+                  partitions = self.get_ntfs_partitions()
+                  values = [display for dev, display in partitions]
+                  cb['values'] = values
+                  if values and not cb.get():
+                      cb.set(values[0])
+
+              def execute_mount(self):
+                  dev = self.extract_dev_path(self.mount_dev.get())
+                  mnt = self.mount_dir.get().strip()
+                  if not dev or not mnt:
+                      messagebox.showerror("Error", "Please provide both device and mount point.")
+                      return
+                  cmd = ["ntfs-3g"]
+                  if self.mount_ro.get():
+                      cmd.extend(["-o", "ro"])
+                  cmd.extend([dev, mnt])
+                  self.run_command(cmd)
+
+              def execute_unmount(self):
+                  mnt = self.mount_dir.get().strip()
+                  if not mnt:
+                      messagebox.showerror("Error", "Please provide the mount point to unmount.")
+                      return
+                  self.run_command(["umount", mnt])
+
+          if __name__ == "__main__":
+              root = tk.Tk()
+              app = NtfsToolsApp(root)
+              root.mainloop()
+          EOF
+
+          cat << 'EOF' > AppRun
+          #!/bin/bash
+          SELF=$(readlink -f "$0")
+          HERE=${SELF%/*}
+          
+          export PATH="${HERE}/usr/bin:${HERE}/usr/sbin:${HERE}/bin:${HERE}/sbin:${PATH}"
+          
+          if [ $# -gt 0 ]; then
+              exec "$@"
+          else
+              exec python3 "${HERE}/usr/share/ntfsprogs/gui.py"
+          fi
+          EOF
+          chmod +x AppRun
+
+          cat << 'EOF' > ntfsprogs.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=NTFS Utilities GUI
+          Exec=AppRun
+          Icon=ntfsprogs
+          Comment=NTFS filesystem utilities GUI (ntfsprogs & ntfs-3g)
+          Categories=System;Utility;
+          EOF
+
+          mkdir -p usr/share/icons/hicolor/scalable/apps/
+          cat << 'EOF' > usr/share/icons/hicolor/scalable/apps/ntfsprogs.svg
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <rect width="64" height="64" fill="#0055aa" rx="8"/>
+            <text x="32" y="38" font-size="16" fill="white" font-family="sans-serif" text-anchor="middle">NTFS</text>
+          </svg>
+          EOF
+          ln -s usr/share/icons/hicolor/scalable/apps/ntfsprogs.svg .
+
+      - name: Download appimagetool and generate AppImage
+        run: |
+          wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+          chmod +x appimagetool
+          
+          export ARCH=x86_64
+          ./appimagetool AppDir ntfsprogs-gui-x86_64.AppImage --appimage-extract-and-run
+
+      - name: Create GitHub Release and Upload AppImage
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "ntfsprogs GUI v1.0.${{ github.run_number }}"
+          body: ""
+          files: ntfsprogs-gui-x86_64.AppImage
